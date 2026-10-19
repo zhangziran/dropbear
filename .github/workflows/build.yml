@@ -1,44 +1,73 @@
-name: Build Dropbear for Soyealink UDX710
+name: Build Static Dropbear (ARM64)
 
 on:
+  # 支持在 GitHub Actions 网页端手动触发工作流
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Cross-compile Dropbear for ARM64
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. 精简安装：只安装 ARM64 交叉编译器和 libcrypt 库
-      - name: Install Dependencies & Cross Toolchain
+      - name: Download and Install musl-cross Toolchain
         run: |
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu make autoconf automake libtool libcrypt-dev:arm64
+          # 下载预编译好的 aarch64 musl 交叉编译工具链，避开 Ubuntu apt 源的依赖
+          wget https://musl.cc/aarch64-linux-musl-cross.tgz -O /tmp/musl-cross.tgz
+          sudo tar -xf /tmp/musl-cross.tgz -C /opt/
+          # 将工具链路径添加到系统环境变量中
+          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
 
-      # 2. 精简配置：直接开启 --enable-static 静态编译并加上 LIBS="-lcrypt"
-      - name: Configure Dropbear (AArch64 Static)
+      - name: Download Dropbear Source
         run: |
+          # 下载最新的 Dropbear 源码（使用 release 压缩包以确保 configure 脚本已生成）
+          wget https://matt.ucc.asn.au/dropbear/releases/dropbear-2024.85.tar.bz2
+          tar -xjf dropbear-2024.85.tar.bz2
+          mv dropbear-2024.85 dropbear
+
+      - name: Configure Dropbear for Static Compilation and Password Auth
+        run: |
+          cd dropbear
+          
+          # 编写 localoptions.h，强制开启密码登录支持（SVR为服务端，CLI为客户端）
+          echo "#define DROPBEAR_SVR_PASSWORD_AUTH 1" >> localoptions.h
+          echo "#define DROPBEAR_CLI_PASSWORD_AUTH 1" >> localoptions.h
+          
+          # 关闭 zlib 依赖以实现极致的纯静态，并指定交叉编译目标与纯静态 LDFLAGS
           ./configure \
-            --host=aarch64-linux-gnu \
-            --enable-static \
+            --host=aarch64-linux-musl \
+            CC=aarch64-linux-musl-gcc \
             --disable-zlib \
-            --disable-pam \
-            CFLAGS="-O2 -Wall" \
-            LIBS="-lcrypt" \
-            STATIC=1
+            LDFLAGS="-static"
 
-      # 3. 精简编译：指定只编译你需要的 dropbear, scp, dbclient, dropbearkey, dropbearconvert
-      - name: Build Dropbear Suite
+      - name: Build Dropbear Binaries
         run: |
-          make -j$(nproc) PROGRAMS="dropbear scp dbclient dropbearkey dropbearconvert" SCPPROGRESS=1
-          aarch64-linux-gnu-strip dropbear scp dbclient dropbearkey dropbearconvert
+          cd dropbear
+          # 编译所有要求的程序，MULTI=0 表示输出独立的二进制文件而非单一的 multi-binary
+          make PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp" MULTI=0 STATIC=1
 
-      # 4. 精简打包：用 upload-artifact 将文件打成 ZIP 包供你在 GitHub 页面直接下载
-      - name: Prepare & Upload Artifacts
+      - name: Strip Binaries & Verify Static Linking
+        run: |
+          cd dropbear
+          
+          # 创建输出目录
+          mkdir -p ../output
+          cp dropbear dbclient dropbearkey dropbearconvert scp ../output/
+          
+          # 使用工具链的 strip 命令瘦身（减小固件体积）
+          /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-strip ../output/*
+          
+          # 打印文件信息，确认架构为 ARM aarch64，且为 statically linked
+          cd ../output
+          file dropbear
+
+      - name: Upload Artifacts
+        # 使用 v4 版本的 artifact 上传工具
         uses: actions/upload-artifact@v4
         with:
-          name: dropbear-soyealink-udx710-arm64
-          path: dropbear scp dbclient dropbearkey dropbearconvert
+          name: dropbear-arm64-static
+          path: output/*
+          retention-days: 7
